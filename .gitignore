@@ -1,0 +1,8 @@
+*.json
+
+results/
+dlp_logs/
+
+__pycache__/
+
+.env
