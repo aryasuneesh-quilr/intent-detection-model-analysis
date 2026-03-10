@@ -3,6 +3,21 @@ Install:
     pip install sentence-transformers scikit-learn numpy requests python-dotenv
 Optional:
     pip install umap-learn hdbscan datasketch
+
+Environment variables (.env or shell exports)
+─────────────────────────────────────────────
+Azure OpenAI (required for LLM analysis):
+    AZURE_OPENAI_ENDPOINT
+    AZURE_OPENAI_API_KEY
+    AZURE_OPENAI_API_VERSION   (default: 2024-08-01-preview)
+    AZURE_OPENAI_DEPLOYMENT    (default: gpt-4.1-mini)
+
+Quilr Platform API (required for api_run_* methods):
+    QUILR_BASE_URL             (default: https://dlp-platform.quilr.ai)
+    QUILR_AUTH                 shared auth token passed as ?auth=
+    QUILR_USERNAME             API username
+    QUILR_PASSWORD             API password
+    QUILR_TENANT_ID            tenant UUID
 """
 
 from __future__ import annotations
@@ -50,9 +65,9 @@ log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def _json_default(obj):
     if isinstance(obj, (np.integer,)):
@@ -81,9 +96,9 @@ def _jaccard(a: Set, b: Set) -> float:
     return len(a & b) / len(a | b)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Audit Logger
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 class DLPLogger:
     """
@@ -171,9 +186,9 @@ class DLPLogger:
         self._fh.close()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Configuration
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class DLPConfig:
@@ -214,6 +229,15 @@ class DLPConfig:
     # Logging
     log_dir: str = "dlp_logs"
 
+    # ── Quilr API (optional — only needed when fetching records via the platform) ──
+    quilr_base_url: str   = field(default_factory=lambda: os.getenv("QUILR_BASE_URL",  "https://dlp-platform.quilr.ai"))
+    quilr_auth:     str   = field(default_factory=lambda: os.getenv("QUILR_AUTH",      ""))
+    quilr_username: str   = field(default_factory=lambda: os.getenv("QUILR_USERNAME",  ""))
+    quilr_password: str   = field(default_factory=lambda: os.getenv("QUILR_PASSWORD",  ""))
+    quilr_tenant_id: str  = field(default_factory=lambda: os.getenv("QUILR_TENANT_ID", ""))
+    # How many seconds of look-back to request when no explicit window is given
+    quilr_default_lookback_hours: int = 72
+
     def headers(self) -> Dict[str, str]:
         return {"Content-Type": "application/json", "api-key": self.api_key}
 
@@ -224,9 +248,9 @@ class DLPConfig:
         )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Azure OpenAI Client
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 class AzureOpenAIClient:
     def __init__(self, config: DLPConfig, dlp_logger: Optional["DLPLogger"] = None):
@@ -379,9 +403,9 @@ class AzureOpenAIClient:
         )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Log Loader
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 class LogLoader:
     @staticmethod
@@ -452,9 +476,200 @@ class LogLoader:
         return detected, undetected
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
+# Quilr Platform API Client
+
+class QuilrAPIClient:
+    """
+    Fetches DLP log records directly from the Quilr platform API.
+
+    Two endpoints are used:
+      GET /dlp/v2/tenant_config  — validates the tenant and retrieves its metadata
+      GET /dlp/v2/logs           — retrieves the raw log records for a time window
+
+    All credentials are passed as query-string parameters exactly as the
+    platform expects them (auth, username, password, tenant_id).
+
+    Environment variables (can be set in .env or the shell):
+        QUILR_BASE_URL       — default: https://dlp-platform.quilr.ai
+        QUILR_AUTH           — the shared auth token (e.g. 67886788)
+        QUILR_USERNAME       — API username
+        QUILR_PASSWORD       — API password
+        QUILR_TENANT_ID      — tenant UUID
+
+    Usage
+    -----
+    client  = QuilrAPIClient(config)
+    records = client.fetch_logs()                      # last 72 h (default)
+    records = client.fetch_logs(lookback_hours=24)     # last 24 h
+    records = client.fetch_logs(start_ts=1772777880.0,
+                                end_ts=1773037080.0)   # explicit window
+    """
+
+    # Quilr returns a JSON array at the top level; the response for 3 days of
+    # traffic can easily exceed 15 MB, so we use a generous timeout.
+    _FETCH_TIMEOUT = 180  # seconds
+
+    def __init__(self, config: DLPConfig):
+        self.cfg = config
+        self._validate_config()
+
+    def _validate_config(self):
+        missing = [
+            name for name, val in [
+                ("quilr_auth",      self.cfg.quilr_auth),
+                ("quilr_username",  self.cfg.quilr_username),
+                ("quilr_password",  self.cfg.quilr_password),
+                ("quilr_tenant_id", self.cfg.quilr_tenant_id),
+            ]
+            if not val
+        ]
+        if missing:
+            raise ValueError(
+                f"QuilrAPIClient: missing required config fields: {missing}. "
+                f"Set them via environment variables (QUILR_AUTH, QUILR_USERNAME, "
+                f"QUILR_PASSWORD, QUILR_TENANT_ID) or pass them in DLPConfig."
+            )
+
+    # ── Tenant config ─────────────────────────────────────────────────────────
+
+    def fetch_tenant_config(self) -> Dict:
+        """
+        Calls /dlp/v2/tenant_config to confirm the tenant exists and is reachable.
+        Returns the raw response dict. Raises on HTTP error.
+        """
+        url    = f"{self.cfg.quilr_base_url}/dlp/v2/tenant_config"
+        params = {
+            "tenant_id": self.cfg.quilr_tenant_id,
+            "auth":      self.cfg.quilr_auth,
+        }
+        log.info(f"Quilr: fetching tenant config for {self.cfg.quilr_tenant_id!r}…")
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        log.info(f"Quilr: tenant config OK — "
+                 f"{len(str(data))} chars returned")
+        return data
+
+    # ── Log records ───────────────────────────────────────────────────────────
+
+    def fetch_logs(
+        self,
+        *,
+        start_ts: Optional[float] = None,
+        end_ts:   Optional[float] = None,
+        lookback_hours: Optional[int] = None,
+    ) -> List[Dict]:
+        """
+        Fetches raw DLP log records from /dlp/v2/logs.
+
+        Time window resolution order:
+          1. Explicit start_ts / end_ts (Unix epoch floats)
+          2. lookback_hours counted back from now
+          3. config.quilr_default_lookback_hours (default 72 h)
+
+        Returns a list of record dicts — the same format that LogLoader.load()
+        returns from a file, so both paths are interchangeable downstream.
+        """
+        now = time.time()
+
+        if end_ts is None:
+            end_ts = now
+        if start_ts is None:
+            hours  = lookback_hours if lookback_hours is not None \
+                     else self.cfg.quilr_default_lookback_hours
+            start_ts = end_ts - (hours * 3600)
+
+        start_dt = datetime.utcfromtimestamp(start_ts).strftime("%Y-%m-%d %H:%M UTC")
+        end_dt   = datetime.utcfromtimestamp(end_ts).strftime("%Y-%m-%d %H:%M UTC")
+        log.info(f"Quilr: fetching logs [{start_dt} → {end_dt}] "
+                 f"for tenant {self.cfg.quilr_tenant_id!r}…")
+
+        url    = f"{self.cfg.quilr_base_url}/dlp/v2/logs"
+        params = {
+            "start_time": start_ts,
+            "end_time":   end_ts,
+            "auth":       self.cfg.quilr_auth,
+            "username":   self.cfg.quilr_username,
+            "password":   self.cfg.quilr_password,
+            "tenant_id":  self.cfg.quilr_tenant_id,
+        }
+
+        try:
+            resp = requests.get(url, params=params, timeout=self._FETCH_TIMEOUT)
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            raise RuntimeError(
+                f"Quilr API returned HTTP {resp.status_code} for /dlp/v2/logs: {e}"
+            ) from e
+        except requests.Timeout:
+            raise RuntimeError(
+                f"Quilr API timed out after {self._FETCH_TIMEOUT}s fetching logs. "
+                f"Try a shorter time window (lookback_hours) or increase _FETCH_TIMEOUT."
+            )
+
+        raw_bytes = len(resp.content)
+        log.info(f"Quilr: received {raw_bytes / 1_048_576:.1f} MB — parsing…")
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise RuntimeError(
+                f"Quilr API response is not valid JSON: {e}. "
+                f"First 500 bytes: {resp.content[:500]!r}"
+            ) from e
+
+        # The API returns a JSON array of record objects.
+        # Guard against unexpected envelope shapes gracefully.
+        if isinstance(data, dict):
+            # Some API versions wrap the array: {"logs": [...], "total": N}
+            for key in ("logs", "records", "data", "results"):
+                if key in data and isinstance(data[key], list):
+                    log.info(f"Quilr: unwrapping envelope key '{key}'")
+                    data = data[key]
+                    break
+            else:
+                raise RuntimeError(
+                    f"Quilr API returned a JSON object instead of an array and "
+                    f"no recognised envelope key was found. Keys: {list(data.keys())}"
+                )
+
+        if not isinstance(data, list):
+            raise RuntimeError(
+                f"Quilr API: expected a JSON array, got {type(data).__name__}."
+            )
+
+        log.info(f"Quilr: {len(data):,} records fetched "
+                 f"({start_dt} → {end_dt})")
+        return data
+
+    # ── Convenience: validate + fetch in one call ─────────────────────────────
+
+    def validate_and_fetch(
+        self,
+        *,
+        start_ts: Optional[float] = None,
+        end_ts:   Optional[float] = None,
+        lookback_hours: Optional[int] = None,
+        skip_tenant_check: bool = False,
+    ) -> List[Dict]:
+        """
+        Optionally validates the tenant config first, then fetches logs.
+        Set skip_tenant_check=True to skip the extra round-trip if you already
+        know the tenant is reachable.
+        """
+        if not skip_tenant_check:
+            self.fetch_tenant_config()
+        return self.fetch_logs(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            lookback_hours=lookback_hours,
+        )
+
+
+
 # Intent Analyzer
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 _INTENT_SYSTEM_PROMPT = (
     "You are a Data Loss Prevention (DLP) expert. Analyze clusters of user prompts "
@@ -864,9 +1079,9 @@ class IntentAnalyzer:
         }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # FP Analyzer
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 _FP_SYSTEM_PROMPT = (
     "You are a DLP expert and ML engineer evaluating whether automated DLP detections "
@@ -1315,9 +1530,9 @@ class FPAnalyzer:
         }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Top-level Orchestrator
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 class DLPAnalysisEngine:
     def __init__(self, config: Optional[DLPConfig] = None):
@@ -1397,3 +1612,109 @@ class DLPAnalysisEngine:
 
     def load_and_run_fp(self, path: str, max_categories: Optional[int] = None) -> Dict:
         return self.run_fp_analysis(LogLoader.load(path), max_categories=max_categories)
+
+    # ── Quilr API-backed entry points ─────────────────────────────────────────
+
+    @property
+    def quilr(self) -> QuilrAPIClient:
+        """Lazily constructed Quilr API client (reuses config credentials)."""
+        if not hasattr(self, "_quilr_client"):
+            self._quilr_client = QuilrAPIClient(self.config)
+        return self._quilr_client
+
+    def api_run_intent(
+        self,
+        *,
+        start_ts: Optional[float] = None,
+        end_ts:   Optional[float] = None,
+        lookback_hours: Optional[int] = None,
+        max_clusters: Optional[int] = None,
+        skip_tenant_check: bool = False,
+    ) -> Dict:
+        """
+        Fetch records from the Quilr platform API and run intent analysis.
+
+        Parameters
+        ----------
+        start_ts / end_ts  : explicit Unix epoch window (float seconds)
+        lookback_hours     : look back N hours from now; overrides default
+                             (config.quilr_default_lookback_hours = 72 h)
+        max_clusters       : passed through to the LLM analysis queue
+        skip_tenant_check  : set True to skip the /tenant_config preflight call
+
+        Example
+        -------
+        engine = DLPAnalysisEngine()        # credentials from .env
+        report = engine.api_run_intent(lookback_hours=48, max_clusters=40)
+        """
+        records = self.quilr.validate_and_fetch(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            lookback_hours=lookback_hours,
+            skip_tenant_check=skip_tenant_check,
+        )
+        return self.run_intent_analysis(records, max_clusters=max_clusters)
+
+    def api_run_fp(
+        self,
+        *,
+        start_ts: Optional[float] = None,
+        end_ts:   Optional[float] = None,
+        lookback_hours: Optional[int] = None,
+        max_categories: Optional[int] = None,
+        skip_tenant_check: bool = False,
+    ) -> Dict:
+        """
+        Fetch records from the Quilr platform API and run FP analysis.
+
+        Parameters
+        ----------
+        start_ts / end_ts  : explicit Unix epoch window (float seconds)
+        lookback_hours     : look back N hours from now; overrides default
+        max_categories     : passed through to the LLM analysis queue
+        skip_tenant_check  : set True to skip the /tenant_config preflight call
+
+        Example
+        -------
+        engine = DLPAnalysisEngine()
+        report = engine.api_run_fp(lookback_hours=48)
+        """
+        records = self.quilr.validate_and_fetch(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            lookback_hours=lookback_hours,
+            skip_tenant_check=skip_tenant_check,
+        )
+        return self.run_fp_analysis(records, max_categories=max_categories)
+
+    def api_run_both(
+        self,
+        *,
+        start_ts: Optional[float] = None,
+        end_ts:   Optional[float] = None,
+        lookback_hours: Optional[int] = None,
+        max_clusters: Optional[int] = None,
+        max_categories: Optional[int] = None,
+        skip_tenant_check: bool = False,
+    ) -> Dict:
+        """
+        Fetch records once and run both intent and FP analysis in sequence.
+        Returns a dict with keys 'intent' and 'fp'.
+
+        Example
+        -------
+        engine  = DLPAnalysisEngine()
+        reports = engine.api_run_both(lookback_hours=72, max_clusters=40)
+        intent_report = reports["intent"]
+        fp_report     = reports["fp"]
+        """
+        records = self.quilr.validate_and_fetch(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            lookback_hours=lookback_hours,
+            skip_tenant_check=skip_tenant_check,
+        )
+        return {
+            "intent": self.run_intent_analysis(records, max_clusters=max_clusters),
+            "fp":     self.run_fp_analysis(records,    max_categories=max_categories),
+        }

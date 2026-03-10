@@ -1,5 +1,4 @@
 """
-Usage:
     # Intent analysis (undetected message clustering)
     python dlp_cli.py intent --input logs.json
 
@@ -30,6 +29,34 @@ Usage:
     --max-categories: Maximum number of categories to send to OpenAI
     --output: Output JSON path (auto-named if omitted)
     --input: Path to JSON log file
+
+─── File mode (existing behaviour, unchanged) ────────────────────────────────
+    python dlp_cli.py intent --input logs.json
+    python dlp_cli.py fp     --input logs.json
+    python dlp_cli.py both   --input logs.json
+
+─── API mode (fetch directly from the logs dashboard) ───────────────────────
+    # Credentials from .env / environment variables (recommended)
+    python dlp_cli.py intent --api
+    python dlp_cli.py fp     --api
+    python dlp_cli.py both   --api
+
+    # Override look-back window (default: 72 h)
+    python dlp_cli.py both --api --lookback-hours 24
+    python dlp_cli.py both --api --lookback-hours 168   # 1 week
+
+    # Explicit Unix-epoch timestamps (float seconds)
+    python dlp_cli.py both --api --start-ts 1772777880 --end-ts 1773037080
+
+    # Override any credential inline (useful for ad-hoc tests)
+    python dlp_cli.py both --api --quilr-tenant-id <uuid> --quilr-auth <token>
+
+─── Environment variables for API mode ──────────────────────────────────────
+    QUILR_BASE_URL      (default: https://dlp-platform.quilr.ai)
+    QUILR_AUTH          shared auth token
+    QUILR_USERNAME      API username
+    QUILR_PASSWORD      API password
+    QUILR_TENANT_ID     tenant UUID
 """
 
 import argparse
@@ -62,7 +89,12 @@ def print_intent_report(report: Dict):
     print(f"  Tenant:              {report['tenant_id']}")
     print(f"  Total messages:      {s['total_messages']}")
     print(f"  Already detected:    {s['messages_with_existing_detection']}")
-    print(f"  Undetected (input):  {s['messages_without_detection']}")
+    print(f"  Undetected (raw):    {s['messages_without_detection']}")
+    # Show preprocessing funnel if present (added in funnel-fix session)
+    if "dropped_in_preprocessing" in s:
+        print(f"  Dropped (preproc):   {s['dropped_in_preprocessing']}"
+              f"  (short / near-duplicate messages removed)")
+        print(f"  Clustered:           {s['clustered_messages']}")
     print(f"  Clusters analyzed:   {s['clusters_analyzed']}")
     print(f"  Sensitive clusters:  {s['sensitive_clusters_found']}")
     print()
@@ -82,10 +114,16 @@ def print_intent_report(report: Dict):
             print(f"\n  #{m['rank']}  [{m['risk_level'].upper()}]  {m['suggested_dlp_model']}")
             print(f"       Category:   {m['intent_category']}")
             print(f"       Confidence: {m['confidence']:.0%}")
+            if m.get("confidence_rationale"):
+                print(f"       Conf why:   {m['confidence_rationale']}")
             print(f"       Why:        {m['intent_description']}")
+            if m.get("risk_rationale"):
+                print(f"       Risk why:   {m['risk_rationale']}")
             print(f"       Keywords:   {', '.join(m['top_keywords'])}")
             print(f"       Messages:   {m['message_count_in_cluster']} in cluster")
-            if m.get("example_triggers"):
+            if m.get("evidence_messages"):
+                print(f"       Evidence:   {m['evidence_messages'][0][:100]}…")
+            elif m.get("example_triggers"):
                 print(f"       Example:    {m['example_triggers'][0][:80]}…")
             if m.get("example_counters"):
                 print(f"       Counter:    {m['example_counters'][0][:80]}…")
@@ -126,10 +164,18 @@ def print_fp_report(report: Dict):
                   f"{item.get('sample_fp_count','?')} FP")
             print(f"       Action:           {item['tuning_recommendation'].replace('_', ' ').upper()}")
             print(f"       FP pattern:       {item['fp_pattern_summary']}")
+            if item.get("fp_rate_rationale"):
+                print(f"       Rate rationale:   {item['fp_rate_rationale']}")
             print(f"       Rationale:        {item['tuning_rationale']}")
+            if item.get("assessment_rationale"):
+                print(f"       Assessment why:   {item['assessment_rationale']}")
             if item.get("suggested_allowlist"):
                 print(f"       Allowlist:        {item['suggested_allowlist'][:3]}")
             print(f"       Risk if disabled: {item['risk_of_disabling'].upper()}")
+            if item.get("key_fp_evidence"):
+                ev = item["key_fp_evidence"][0]
+                print(f"       Key evidence:     [{ev.get('verdict')}] "
+                      f"{ev.get('input_snippet','')[:80]}…")
 
     print("\n─── All Categories ───────────────────────────────────────────────────")
     for r in report.get("all_category_results", []):
@@ -154,34 +200,83 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("mode", choices=["intent", "fp", "both"],
                         help="Analysis mode: intent clustering, FP analysis, or both")
-    parser.add_argument("--input",   required=True, help="Path to JSON log file")
-    parser.add_argument("--output",  default=None,  help="Output JSON path (auto-named if omitted)")
-    parser.add_argument("--debug",   action="store_true", help="Enable DEBUG logging")
+    parser.add_argument("--output", default=None,
+                        help="Output JSON path (auto-named if omitted)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable DEBUG logging")
 
-    # Intent options
+    # ── Input source (mutually exclusive) ─────────────────────────────────────
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--input", metavar="FILE",
+                     help="Path to a local JSON log file (file mode)")
+    src.add_argument("--api", action="store_true",
+                     help="Fetch records from the Quilr platform API (API mode)")
+
+    # ── API mode: time window ──────────────────────────────────────────────────
+    ag = parser.add_argument_group(
+        "API mode — time window (--api only)",
+        "Only one of --lookback-hours or --start-ts/--end-ts may be used. "
+        "Default: 72 h look-back."
+    )
+    ag.add_argument("--lookback-hours", type=int, default=None,
+                    metavar="N",
+                    help="Fetch logs from the last N hours (default: 72)")
+    ag.add_argument("--start-ts", type=float, default=None,
+                    metavar="EPOCH",
+                    help="Explicit window start (Unix epoch, float seconds)")
+    ag.add_argument("--end-ts", type=float, default=None,
+                    metavar="EPOCH",
+                    help="Explicit window end (Unix epoch, float seconds; default: now)")
+
+    # ── API mode: credential overrides ────────────────────────────────────────
+    cg = parser.add_argument_group(
+        "API mode — credential overrides (--api only)",
+        "These override the corresponding environment variables for this run only. "
+        "Omit to rely on .env / shell exports."
+    )
+    cg.add_argument("--quilr-base-url",    default=None, metavar="URL")
+    cg.add_argument("--quilr-auth",        default=None, metavar="TOKEN")
+    cg.add_argument("--quilr-username",    default=None, metavar="USER")
+    cg.add_argument("--quilr-password",    default=None, metavar="PASS")
+    cg.add_argument("--quilr-tenant-id",   default=None, metavar="UUID")
+    cg.add_argument("--skip-tenant-check", action="store_true",
+                    help="Skip the /tenant_config preflight call")
+
+    # ── Intent analysis options ───────────────────────────────────────────────
     ig = parser.add_argument_group("Intent analysis options")
-    ig.add_argument("--max-clusters",         type=int,   default=None)
-    ig.add_argument("--eps",                  type=float, default=0.35)
-    ig.add_argument("--min-samples",          type=int,   default=3)
-    ig.add_argument("--clustering-algorithm", choices=["dbscan", "hdbscan"], default="dbscan")
-    ig.add_argument("--use-umap",             action="store_true")
-    ig.add_argument("--umap-components",      type=int,   default=50)
-    ig.add_argument("--umap-neighbors",       type=int,   default=15)
-    ig.add_argument("--umap-min-dist",        type=float, default=0.1)
-    ig.add_argument("--dedup-method",         choices=["jaccard", "minhash"], default="jaccard")
-    ig.add_argument("--jaccard-threshold",    type=float, default=0.92)
-    ig.add_argument("--minhash-threshold",    type=float, default=0.8)
-    ig.add_argument("--min-token-length",     type=int,   default=15)
-    ig.add_argument("--representatives",      type=int,   default=5)
-    ig.add_argument("--keywords",             type=int,   default=10)
+    ig.add_argument("--max-clusters",          type=int,   default=None)
+    ig.add_argument("--eps",                   type=float, default=0.35)
+    ig.add_argument("--min-samples",           type=int,   default=3)
+    ig.add_argument("--clustering-algorithm",  choices=["dbscan", "hdbscan"], default="dbscan")
+    ig.add_argument("--use-umap",              action="store_true")
+    ig.add_argument("--umap-components",       type=int,   default=50)
+    ig.add_argument("--umap-neighbors",        type=int,   default=15)
+    ig.add_argument("--umap-min-dist",         type=float, default=0.1)
+    ig.add_argument("--dedup-method",          choices=["jaccard", "minhash"], default="jaccard")
+    ig.add_argument("--jaccard-threshold",     type=float, default=0.92)
+    ig.add_argument("--minhash-threshold",     type=float, default=0.8)
+    ig.add_argument("--min-token-length",      type=int,   default=15)
+    ig.add_argument("--representatives",       type=int,   default=5)
+    ig.add_argument("--keywords",              type=int,   default=10)
 
-    # FP options
+    # ── FP analysis options ───────────────────────────────────────────────────
     fg = parser.add_argument_group("FP analysis options")
-    fg.add_argument("--max-categories",       type=int, default=None)
-    fg.add_argument("--samples-per-category", type=int, default=8)
-    fg.add_argument("--min-occurrences",      type=int, default=2)
+    fg.add_argument("--max-categories",        type=int, default=None)
+    fg.add_argument("--samples-per-category",  type=int, default=8)
+    fg.add_argument("--min-occurrences",       type=int, default=2)
 
     return parser
+
+
+def _validate_api_args(args):
+    """Extra cross-argument validation for API mode."""
+    if not args.api:
+        return
+    if args.lookback_hours is not None and \
+       (args.start_ts is not None or args.end_ts is not None):
+        print("error: --lookback-hours cannot be combined with --start-ts / --end-ts",
+              file=sys.stderr)
+        sys.exit(2)
 
 
 def _save(report: Dict, path: str):
@@ -197,11 +292,13 @@ def _save(report: Dict, path: str):
 def main():
     parser = build_parser()
     args   = parser.parse_args()
+    _validate_api_args(args)
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    config = DLPConfig(
+    # ── Build config (common + any Quilr credential overrides) ───────────────
+    config_kwargs = dict(
         dbscan_eps=args.eps,
         dbscan_min_samples=args.min_samples,
         clustering_algorithm=args.clustering_algorithm,
@@ -218,10 +315,45 @@ def main():
         fp_samples_per_category=args.samples_per_category,
         fp_min_occurrences=args.min_occurrences,
     )
-    engine  = DLPAnalysisEngine(config)
-    records = engine.loader.load(args.input)
-    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Only inject credential overrides when they were explicitly supplied,
+    # so that .env values remain in effect when args are None.
+    if args.api:
+        if args.quilr_base_url:  config_kwargs["quilr_base_url"]  = args.quilr_base_url
+        if args.quilr_auth:      config_kwargs["quilr_auth"]      = args.quilr_auth
+        if args.quilr_username:  config_kwargs["quilr_username"]  = args.quilr_username
+        if args.quilr_password:  config_kwargs["quilr_password"]  = args.quilr_password
+        if args.quilr_tenant_id: config_kwargs["quilr_tenant_id"] = args.quilr_tenant_id
 
+    config = DLPConfig(**config_kwargs)
+    engine = DLPAnalysisEngine(config)
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # ── Fetch records (file or API) ───────────────────────────────────────────
+    if args.api:
+        print(f"\n  📡  API mode — fetching from Quilr platform…")
+        if args.lookback_hours:
+            print(f"       Look-back:  {args.lookback_hours} hours")
+        elif args.start_ts:
+            from datetime import datetime as _dt
+            s = _dt.utcfromtimestamp(args.start_ts).strftime("%Y-%m-%d %H:%M UTC")
+            e = _dt.utcfromtimestamp(args.end_ts).strftime("%Y-%m-%d %H:%M UTC") \
+                if args.end_ts else "now"
+            print(f"       Window:     {s} → {e}")
+        else:
+            print(f"       Look-back:  72 hours (default)")
+
+        # Fetch once — reused for both intent and FP if mode == "both"
+        records = engine.quilr.validate_and_fetch(
+            start_ts=args.start_ts,
+            end_ts=args.end_ts,
+            lookback_hours=args.lookback_hours,
+            skip_tenant_check=args.skip_tenant_check,
+        )
+        print(f"       Fetched:    {len(records):,} records\n")
+    else:
+        records = engine.loader.load(args.input)
+
+    # ── Run analysis ──────────────────────────────────────────────────────────
     if args.mode in ("intent", "both"):
         report = engine.run_intent_analysis(records, max_clusters=args.max_clusters)
         path   = args.output or f"dlp_intent_{ts}.json"
@@ -230,9 +362,8 @@ def main():
 
     if args.mode in ("fp", "both"):
         report = engine.run_fp_analysis(records, max_categories=args.max_categories)
-        path   = args.output or f"dlp_fp_{ts}.json"
-        if args.mode == "both":
-            path = f"dlp_fp_{ts}.json"
+        path   = args.output if args.mode == "fp" and args.output \
+                 else f"dlp_fp_{ts}.json"
         _save(report, path)
         print_fp_report(report)
 
